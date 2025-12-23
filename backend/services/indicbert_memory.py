@@ -21,7 +21,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import Session
 from sqlalchemy import text, desc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 from contextlib import contextmanager
@@ -288,8 +288,8 @@ class IndicBERTMemoryService:
                 embedding=embedding_list,
                 access_count=0,
                 is_active=True,
-                created_at=datetime.utcnow(),
-                last_accessed=datetime.utcnow()
+                created_at=datetime.now(timezone.utc),
+                last_accessed=datetime.now(timezone.utc)
             )
             
             # Add to database
@@ -358,8 +358,8 @@ class IndicBERTMemoryService:
                     embedding=embedding.tolist(),
                     access_count=0,
                     is_active=True,
-                    created_at=datetime.utcnow(),
-                    last_accessed=datetime.utcnow()
+                    created_at=datetime.now(timezone.utc),
+                    last_accessed=datetime.now(timezone.utc)
                 )
                 memories.append(memory)
             
@@ -462,7 +462,7 @@ class IndicBERTMemoryService:
                 
                 # Apply recency boost (recently accessed memories rank higher)
                 if apply_recency_boost and memory.last_accessed:
-                    days_since_access = (datetime.utcnow() - memory.last_accessed).days
+                    days_since_access = (datetime.now(timezone.utc) - memory.last_accessed).days
                     recency_factor = 1.0 + (0.1 if days_since_access < 7 else 0.0)
                     score *= recency_factor
                 
@@ -515,7 +515,7 @@ class IndicBERTMemoryService:
             db.query(Memory).filter(Memory.id.in_(memory_ids)).update(
                 {
                     Memory.access_count: Memory.access_count + 1,
-                    Memory.last_accessed: datetime.utcnow()
+                    Memory.last_accessed: datetime.now(timezone.utc)
                 },
                 synchronize_session=False
             )
@@ -587,7 +587,7 @@ class IndicBERTMemoryService:
         """
         try:
             # Update unpinned memories older than 24 hours
-            cutoff_time = datetime.utcnow() - timedelta(hours=24)
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
             
             affected = db.query(Memory).filter(
                 Memory.user_id == user_id,
@@ -718,7 +718,10 @@ class IndicBERTMemoryService:
         user_id: str,
         query_text: str,
         top_k: int = 5,
-        memory_types: Optional[List[str]] = None
+        memory_types: Optional[List[str]] = None,
+        min_importance: float = 0.0,
+        apply_decay: bool = True,
+        apply_recency_boost: bool = True
     ) -> List[Dict[str, Any]]:
         """
         Async wrapper for retrieve_memories (runs in thread pool).
@@ -727,7 +730,7 @@ class IndicBERTMemoryService:
         return await loop.run_in_executor(
             None,
             self.retrieve_memories,
-            db, user_id, query_text, top_k, memory_types
+            db, user_id, query_text, top_k, memory_types, min_importance, apply_decay, apply_recency_boost
         )
     
     # ========================================================================

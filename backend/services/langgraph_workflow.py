@@ -26,8 +26,8 @@ import logging
 import time
 import threading
 from typing import Dict, List, Optional, Annotated, Any, TypedDict, Literal
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 from enum import Enum
 
@@ -46,6 +46,8 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # ✅ Correct 
 from langchain.agents import AgentState
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.runtime import Runtime
+
+from backend.utils.serialization import sanitize_for_state
 
 # GuppShupp service imports
 from backend.services.whisper_asr import (
@@ -239,7 +241,7 @@ class WorkflowServices:
             # Initialize TTS service
             self.tts_service = ParlerTTSService(
                 config=TTSConfig(
-                    modelname="ai4bharat/indic-parler-tts",
+                    model_name="ai4bharat/indic-parler-tts",
                     device="cuda" if torch.cuda.is_available() else "cpu",
                     sampling_rate=44100,
                     cache_enabled=True,
@@ -338,9 +340,10 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         # Return state updates
+        # ✅ Convert ProsodyResult to dict for msgpack serialization (checkpointer requirement)
         return {
             "transcription": transcription,
-            "prosody_features": prosody_features,
+            "prosody_features": sanitize_for_state(prosody_features),
             "audio_analysis_error": transcription_error or prosody_error,
             "audio_analysis_time_ms": elapsed_ms,
             "messages": [
@@ -349,6 +352,7 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
                 )
             ],
         }
+
 
     except Exception as e:
         logger.error(f"[PHASE 1] Critical error: {e}", exc_info=True)
@@ -386,9 +390,9 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
 
             memory_task = _workflow_services.memory_service.retrieve_memories_async(
                 db=_workflow_services.db_session,
-                userid=state["user_id"],
-                querytext=query_text,
-                topk=5,
+                user_id=state["user_id"],
+                query_text=query_text,
+                top_k=5,
                 memory_types=["long_term", "episodic"],
                 min_importance=0.3,
                 apply_decay=True,
@@ -443,7 +447,7 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
                 "user_id": state["user_id"],
                 "session_id": state["session_id"],
                 "conversation_id": state["conversation_id"],
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
             "context_prep_error": None,
             "context_prep_time_ms": elapsed_ms,
@@ -483,7 +487,7 @@ async def phase_3_llm_generation_with_guardrails(
 
     try:
         # Build rich context for Gemini
-        acoustic_features = asdict(state["prosody_features"]) if state["prosody_features"] else {}
+        acoustic_features = sanitize_for_state(state.get("prosody_features")) or {}
         
         # Call Gemini LLM - it handles safety internally with comprehensive guardrails
         llm_response = await _workflow_services.llm_service.analyze_and_respond_async(
@@ -805,7 +809,7 @@ async def _get_or_create_conversation(
                 sentiment="neutral",
                 detected_intent="unknown",
                 intent_confidence=0.0,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             _workflow_services.db_session.add(conv)
             _workflow_services.db_session.commit()
@@ -884,10 +888,15 @@ def _store_conversation(state: WorkflowState) -> bool:
             intent_confidence=state["llm_response"].intent_confidence,
             
             # Prosody features (complete JSONB storage)
-            prosody_features=asdict(state["prosody_features"]) if state["prosody_features"] else None,
-            
+            prosody_features=state.get("prosody_features"),
+
             # Audio metadata
-            audio_duration_seconds=state["prosody_features"].meta_info.get("duration_sec", 0)
+            audio_duration_seconds=(
+                state.get("prosody_features", {})
+                    .get("meta_info", {})
+                    .get("duration_sec", 0.0)
+            )
+
             if state["prosody_features"]
             else 0,
             audio_file_path=state["audio_path"],
@@ -901,10 +910,10 @@ def _store_conversation(state: WorkflowState) -> bool:
             
             # Safety & moderation (from Gemini's safety assessment)
             safety_check_passed=state["llm_response"].safety_flags.crisis_risk != "high",
-            safety_flags=asdict(state["llm_response"].safety_flags),
+            safety_flags = sanitize_for_state(state["llm_response"].safety_flags),
             
             # Timestamp
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             
             # ✅ SEMANTIC EMBEDDING FOR VECTOR SEARCH
             embedding=embedding_list,
@@ -1017,7 +1026,7 @@ async def execute_workflow(
         "messages": [],
         "total_time_ms": 0,
         "workflow_status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
     }
 
@@ -1035,7 +1044,7 @@ async def execute_workflow(
             # Pattern from knowledge base lines 27501-27538
             async with AsyncPostgresSaver.from_conn_string(config.database.url) as checkpointer:
                 # Optional: Auto-create checkpoint tables (uncomment if needed)
-                await checkpointer.setup()
+                # await checkpointer.setup()
                 
                 # Compile graph with checkpointer inside context manager
                 graph = create_workflow_graph(db_session)
@@ -1109,7 +1118,7 @@ async def execute_workflow(
         total_ms = int((time.time() - workflow_start) * 1000)
         output["total_time_ms"] = total_ms
         output["workflow_status"] = "completed"
-        output["completed_at"] = datetime.utcnow().isoformat()
+        output["completed_at"] = datetime.now(timezone.utc).isoformat()
 
         logger.info(
             f"Workflow {initial_state['request_id']} completed in {total_ms}ms\n"
@@ -1127,7 +1136,7 @@ async def execute_workflow(
         total_ms = int((time.time() - workflow_start) * 1000)
         initial_state["total_time_ms"] = total_ms
         initial_state["workflow_status"] = "failed"
-        initial_state["completed_at"] = datetime.utcnow().isoformat()
+        initial_state["completed_at"] = datetime.now(timezone.utc).isoformat()
         return initial_state
 
 
@@ -1153,13 +1162,19 @@ if __name__ == "__main__":
         # Import SessionLocal AFTER init_database() so it's not None
         from backend.database.database import SessionLocal
         db_session = SessionLocal()
+        
+        from uuid import uuid4
+        
+        user_id = uuid4()
+        session_id = uuid4()
 
         try:
             result = await execute_workflow(
                 workflow_input={
                     "audio_path": audio_file,
-                    "user_id": "test-user-123",
-                    "session_id": "test-session-456",
+                    "user_id": "0c52f2b6-a083-4eef-b956-390c2bc0f542",
+                    "session_id": "3233a928-47ea-4e03-af4e-71328659e8f9",
+
                     "character_profile": {
                         "name": "Aarav",
                         "background": "Empathetic AI companion for Indian youth",
@@ -1201,4 +1216,11 @@ if __name__ == "__main__":
             await _workflow_services.shutdown_async()
             db_session.close()
 
+    # Fix for Windows: psycopg async needs SelectorEventLoop, not ProactorEventLoop
+    import sys
+    if sys.platform == 'win32':
+        import asyncio
+        import selectors
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     asyncio.run(main())
