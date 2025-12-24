@@ -118,7 +118,7 @@ class WorkflowInput(TypedDict):
     user_id: str  # User UUID for memory retrieval and personalization
     session_id: str  # Session UUID for conversation tracking
     conversation_id: Optional[str]  # Current conversation UUID
-    character_profile: Dict[str, Any]  # Aarav personality configuration
+    session_context: Dict[str, Any]  # Contains: current_tts_speaker, session_language, voice_preferences
     request_id: Optional[str]  # For tracing and debugging
 
 
@@ -130,7 +130,7 @@ class WorkflowState(TypedDict):
     user_id: str
     session_id: str
     conversation_id: Optional[str]
-    character_profile: Dict[str, Any]
+    session_context: Dict[str, Any]  # Contains: current_tts_speaker, session_language, voice_preferences
     request_id: str
 
     # Phase 1: Audio Analysis (parallel)
@@ -161,6 +161,10 @@ class WorkflowState(TypedDict):
     tts_response: Optional[TTSResponse]
     tts_error: Optional[str]
     tts_time_ms: int
+    
+    # TTS Speaker Tracking (for session persistence)
+    current_tts_speaker: Optional[str]  # Track the current speaker for session consistency
+    voice_preferences: Dict[str, Any]  # User's voice preferences (gender, etc.)
 
     # Phase 5: Database Persistence (sequential)
     conversation_stored: bool
@@ -489,6 +493,11 @@ async def phase_3_llm_generation_with_guardrails(
         # Build rich context for Gemini
         acoustic_features = sanitize_for_state(state.get("prosody_features")) or {}
         
+        # Build session context with current TTS speaker for consistency
+        session_context = state.get("session_context", {})
+        session_context["current_tts_speaker"] = state.get("current_tts_speaker")
+        session_context["voice_preferences"] = state.get("voice_preferences", {})
+        
         # Call Gemini LLM - it handles safety internally with comprehensive guardrails
         llm_response = await _workflow_services.llm_service.analyze_and_respond_async(
             transcript=state["transcription"].text if state["transcription"] else "",
@@ -497,7 +506,7 @@ async def phase_3_llm_generation_with_guardrails(
             short_term_context=state["short_term_context"],
             long_term_memories=state["long_term_memories"],
             episodic_memories=state["episodic_memories"],
-            character_profile=state["character_profile"],
+            session_context=session_context,  # Contains TTS speaker info
             safety_context={},  # Gemini handles this internally
             temperature=config.gemini.temperature,
             max_output_tokens=config.gemini.max_output_tokens,
@@ -509,6 +518,8 @@ async def phase_3_llm_generation_with_guardrails(
             f"[PHASE 3] ✓ LLM response generated ({elapsed_ms}ms): "
             f"emotion={llm_response.detected_emotion}, "
             f"intent={llm_response.detected_intent}, "
+            f"speaker={llm_response.tts_speaker}, "
+            f"voice_change={llm_response.voice_change_requested}, "
             f"memories={len(llm_response.memory_updates)}, "
             f"safety_risk={llm_response.safety_flags.crisis_risk}"
         )
@@ -516,6 +527,11 @@ async def phase_3_llm_generation_with_guardrails(
         # Determine safety action based on Gemini's assessment
         safety_action = "escalate" if llm_response.safety_flags.crisis_risk == "high" else "continue"
         safety_passed = llm_response.safety_flags.crisis_risk != "high"
+        
+        # Update voice preferences if user specified gender
+        voice_preferences = state.get("voice_preferences", {})
+        if llm_response.preferred_speaker_gender != "any":
+            voice_preferences["gender"] = llm_response.preferred_speaker_gender
 
         return {
             "llm_response": llm_response,
@@ -524,6 +540,9 @@ async def phase_3_llm_generation_with_guardrails(
             "safety_action": safety_action,
             "llm_error": None,
             "llm_time_ms": elapsed_ms,
+            # Update TTS speaker for session persistence
+            "current_tts_speaker": llm_response.tts_speaker,
+            "voice_preferences": voice_preferences,
             "messages": [
                 AIMessage(
                     content=f"[Phase 3] LLM generation completed in {elapsed_ms}ms\\n"
@@ -568,19 +587,23 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
 
         # Extract TTS parameters from LLM response
         spoken_text = state["llm_response"].response_text
-        speaker = state["llm_response"].tts_speaker or "Thoma"
-        description = state["llm_response"].tts_style_prompt or "neutral, conversational tone"
+        speaker = state["llm_response"].tts_speaker or "Rohit"
+        tts_style = state["llm_response"].tts_style_prompt or "speaks at a moderate pace with a calm tone in a close-sounding environment with clear audio quality."
+        
+        # Concatenate speaker name with description (LLM generates "speaks..." format)
+        # Result: "Rohit speaks at a moderate pace with..."
+        full_description = f"{speaker} {tts_style}"
 
         logger.info(
             f"[PHASE 4] TTS input: speaker={speaker}, "
-            f"description={description[:50]}..., text_length={len(spoken_text)}"
+            f"description={full_description[:60]}..., text_length={len(spoken_text)}"
         )
 
-        # Create TTS request
+        # Create TTS request with full description
         tts_request = TTSRequest(
             spoken_text=spoken_text,
             speaker=speaker,
-            description=description,
+            description=full_description,  # Now includes speaker name + style
         )
 
         # Generate TTS audio asynchronously
@@ -943,7 +966,7 @@ def _store_memories(state: WorkflowState) -> bool:
         # Convert LLM memory updates to database models with IndicBERT embeddings
         stored_memories = _workflow_services.memory_service.store_memories_batch(
             db=_workflow_services.db_session,
-            userid=state["user_id"],
+            user_id=state["user_id"],  # Fixed: was 'userid', should be 'user_id'
             memory_updates=state["llm_response"].memory_updates,
             conversation_id=state["conversation_id"],
         )
@@ -989,13 +1012,12 @@ async def execute_workflow(
         "user_id": workflow_input["user_id"],
         "session_id": workflow_input["session_id"],
         "conversation_id": workflow_input.get("conversation_id"),
-        "character_profile": workflow_input.get(
-            "character_profile",
+        "session_context": workflow_input.get(
+            "session_context",
             {
-                "name": "Aarav",
-                "background": "Empathetic AI companion for Indian youth",
-                "traits": ["empathetic", "culturally aware", "patient"],
-                "speech_style": "conversational, validates emotions",
+                "current_tts_speaker": None,  # Will be set by LLM
+                "session_language": "auto",
+                "voice_preferences": {},
             },
         ),
         "request_id": workflow_input.get("request_id") or f"req_{int(time.time() * 1000)}",
@@ -1019,6 +1041,9 @@ async def execute_workflow(
         "tts_response": None,
         "tts_error": None,
         "tts_time_ms": 0,
+        # TTS Speaker Tracking (for session persistence)
+        "current_tts_speaker": workflow_input.get("session_context", {}).get("current_tts_speaker"),
+        "voice_preferences": workflow_input.get("session_context", {}).get("voice_preferences", {}),
         "conversation_stored": False,
         "memories_stored": False,
         "db_error": None,
