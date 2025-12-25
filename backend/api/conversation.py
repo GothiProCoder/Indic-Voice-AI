@@ -268,29 +268,57 @@ def build_chat_response(
     # Get TTS audio
     # ⚠️ CRITICAL: tts_response is now a DICT after sanitize_for_state()
     # It was converted from TTSResponse dataclass to avoid MsgPack serialization issues
+    # ✅ ENHANCED: Get TTS audio with strict validation
     response_audio_base64 = ""
     response_duration_seconds = 0.0
-    
+
     if tts_response:
-        # tts_response is a dict with keys: audio_array, audio_base64_wav, sampling_rate, etc.
+        # tts_response is now a dict (from Phase 4 return)
         response_audio_base64 = tts_response.get("audio_base64_wav", "") or ""
-        
-        if response_audio_base64:
-            logger.info(f"TTS audio base64 length: {len(response_audio_base64)}")
-        else:
-            logger.warning("TTS response has no audio data!")
-        
         response_duration_seconds = tts_response.get("duration_seconds", 0.0) or 0.0
+        
+        # ✅ CRITICAL VALIDATION
+        if response_audio_base64:
+            audio_len = len(response_audio_base64)
+            logger.info(
+                f"[{request_id}] ✅ TTS audio received: "
+                f"{audio_len} chars, duration={response_duration_seconds:.2f}s"
+            )
+            
+            # Sanity check: base64 should be at least 1000 chars for 1+ second audio
+            if audio_len < 1000:
+                logger.error(
+                    f"[{request_id}] ⚠️ Audio suspiciously short: {audio_len} chars. "
+                    "Possible truncation in workflow!"
+                )
+        else:
+            logger.error(
+                f"[{request_id}] ❌ TTS response missing audio_base64_wav! "
+                f"Keys present: {list(tts_response.keys())}"
+            )
+    else:
+        logger.error(f"[{request_id}] ❌ No tts_response in workflow_result!")
 
 
     
     # Build phase timings
+    # ✅ FIXED: Match workflow field names exactly
     phase_timings = PhaseTimings(
         audio_analysis_ms=workflow_result.get("audio_analysis_time_ms", 0),
         context_preparation_ms=workflow_result.get("context_prep_time_ms", 0),
         llm_generation_ms=workflow_result.get("llm_time_ms", 0),
         tts_generation_ms=workflow_result.get("tts_time_ms", 0),
         database_persistence_ms=workflow_result.get("db_time_ms", 0),
+    )
+
+    # ✅ ADD: Debug logging to verify timings
+    logger.debug(
+        f"[{request_id}] Phase timings: "
+        f"audio={phase_timings.audio_analysis_ms}ms, "
+        f"context={phase_timings.context_preparation_ms}ms, "
+        f"llm={phase_timings.llm_generation_ms}ms, "
+        f"tts={phase_timings.tts_generation_ms}ms, "
+        f"db={phase_timings.database_persistence_ms}ms"
     )
     
     return ChatResponse(

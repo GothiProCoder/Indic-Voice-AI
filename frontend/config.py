@@ -16,7 +16,7 @@ class FrontendConfig:
     """Frontend configuration settings."""
     
     # Backend API
-    api_base_url: str = os.getenv("API_BASE_URL", "http://localhost:8000")
+    api_base_url: str = os.getenv("API_BASE_URL", "https://e83cc05319fd.ngrok-free.app")
     api_version: str = "v1"
     
     # Timeouts
@@ -24,7 +24,7 @@ class FrontendConfig:
     request_timeout_seconds: int = 120   # Max total request time
     
     # Audio
-    max_audio_size_mb: int = 10
+    max_audio_size_mb: int = 100
     supported_formats: tuple = ("wav", "mp3", "webm", "ogg")
     
     # UI

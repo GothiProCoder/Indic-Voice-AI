@@ -346,8 +346,8 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
         # Log results
         if transcription:
             logger.info(
-                f"[PHASE 1] ✓ Transcription: {transcription.get('text', '')[:100]}... "
-                f"({transcription.get('word_count', 0)} words, {transcription.get('processing_time_ms', 0)}ms)"
+                f"[PHASE 1] ✓ Transcription: {transcription.text[:100]}... "
+                f"({transcription.word_count} words, {transcription.processing_time_ms}ms)"
             )
         if prosody_features:
             logger.info(
@@ -658,7 +658,12 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
             # ⚠️ CRITICAL: sanitize_for_state converts TTSResponse to dict
             # This is required because TTSResponse contains numpy.ndarray
             # which cannot be serialized by LangGraph's MsgPack checkpointer
-            "tts_response": sanitize_for_state(tts_response),
+            "tts_response": {
+                "audio_base64_wav": tts_response.audio_base64_wav,  # ← Keep audio!
+                "duration_seconds": tts_response.duration_seconds,
+                "sampling_rate": tts_response.sampling_rate,
+                "generation_time_ms": tts_response.generation_time_ms,
+            },
             "tts_error": None,
             "tts_time_ms": elapsed_ms,
             "messages": [
@@ -709,32 +714,37 @@ async def phase_5_database_persistence(state: WorkflowState) -> Dict[str, Any]:
 
         # Store conversation
         loop = asyncio.get_event_loop()
-        conversation_stored = await loop.run_in_executor(
+        stored_conversation_id = await loop.run_in_executor(
             None,
             _store_conversation,
             state,
         )
 
+        conversation_stored = stored_conversation_id is not None
+
         if conversation_stored:
             logger.info(f"[PHASE 5] ✓ Conversation stored")
+            # 2. CRITICAL FIX: Update state with the ACTUAL ID so memories link correctly
+            state["conversation_id"] = stored_conversation_id
 
-        # Store memories if LLM proposed any
-        if state["llm_response"].memory_updates:
-            memories_stored = await loop.run_in_executor(
-                None,
-                _store_memories,
-                state,
-            )
-            if memories_stored:
-                logger.info(
-                    f"[PHASE 5] ✓ Stored {len(state['llm_response'].memory_updates)} memories"
+        # Only try to store memories if we have a valid conversation ID to link to
+            if state["llm_response"].memory_updates and stored_conversation_id:
+                memories_stored = await loop.run_in_executor(
+                    None, 
+                    store_memories_with_id,  # New function that takes ID directly
+                    state,
+                    stored_conversation_id  # Pass as argument
                 )
+                if memories_stored:
+                    logger.info(f"[PHASE 5] ✓ Stored memories linked to {stored_conversation_id}")
+            else:
+                logger.error("[PHASE 5] Cannot store memories: Conversation save failed (No ID)")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         return {
             "conversation_stored": conversation_stored,
-            "memories_stored": memories_stored,
+            "memories_stored": memories_stored if 'memories_stored' in locals() else False,
             "db_error": None,
             "db_time_ms": elapsed_ms,
             "messages": [
@@ -798,6 +808,29 @@ def create_workflow_graph(db_session: Session) -> StateGraph:
 # ============================================================================
 # HELPER FUNCTIONS - Supporting utilities for workflow phases
 # ============================================================================
+
+def store_memories_with_id(state: WorkflowState, conversation_id: str) -> bool:
+    """
+    Store memories extracted by LLM with explicit conversation ID.
+    """
+    try:
+        if not state["llm_response"] or not state["llm_response"].memory_updates:
+            return False
+        
+        # Use the passed conversation_id directly - no state lookup
+        stored_memories = _workflow_services.memory_service.store_memories_batch(
+            db=_workflow_services.db_session,
+            user_id=state["user_id"],
+            memory_updates=state["llm_response"].memory_updates,
+            conversation_id=conversation_id,  # Direct argument
+        )
+        
+        logger.info(f"✅ Stored {len(stored_memories)} memories linked to {conversation_id}")
+        return len(stored_memories) > 0
+        
+    except Exception as e:
+        logger.error(f"Failed to store memories: {e}", exc_info=True)
+        return False
 
 
 async def _get_session_context(
@@ -906,117 +939,104 @@ def _get_fallback_llm_response(error_message: str) -> GeminiLLMResponse:
     )
 
 
-def _store_conversation(state: WorkflowState) -> bool:
+def _store_conversation(state: WorkflowState) -> Optional[str]: # Updated return type
     """
     Store conversation to database with ALL required fields.
-    
-    CRITICAL: Uses IndicBERT to generate semantic embeddings for search.
+    Returns the string UUID of the conversation if successful.
     """
     try:
         if not state["llm_response"] or not state["transcription"]:
             logger.warning("Missing LLM response or transcription - skipping storage")
-            return False
+            return None # Return None instead of False
 
-        # ⚠️ transcription is now a dict after sanitize_for_state()
         user_text = state["transcription"].get("text", "")
         logger.info(f"Generating IndicBERT embedding for: {user_text[:50]}...")
         embedding = _workflow_services.memory_service.embed_text(user_text, use_cache=False)
-        embedding_list = embedding.tolist()  # Convert numpy to list for pgvector
+        embedding_list = embedding.tolist()
 
-        # Create Conversation object with CORRECT field names
         conversation = Conversation(
             user_id=state["user_id"],
             session_id=state["session_id"],
-            
-            # ✅ CORRECT FIELD NAMES (matching database schema)
             user_input_text=user_text,
             ai_response_text=state["llm_response"].response_text,
-            
-            # Language detection - ⚠️ transcription is now a dict
             detected_language=state["transcription"].get("language", "en") if state["transcription"] else "en",
             response_language=state["llm_response"].response_language,
             is_code_mixed=state["transcription"].get("is_code_mixed", False) if state["transcription"] else False,
             code_mix_languages=state["transcription"].get("detected_languages") if state["transcription"] else None,
-            
-            # Emotion & sentiment (from Gemini LLM)
             detected_emotion=state["llm_response"].detected_emotion,
             emotion_confidence=state["llm_response"].emotion_confidence,
             sentiment=state["llm_response"].sentiment,
-            
-            # Intent classification (from Gemini LLM)
             detected_intent=state["llm_response"].detected_intent,
             intent_confidence=state["llm_response"].intent_confidence,
-            
-            # Prosody features (complete JSONB storage)
             prosody_features=state.get("prosody_features"),
-
-            # Audio metadata
             audio_duration_seconds=(
                 state.get("prosody_features", {})
                     .get("meta_info", {})
                     .get("duration_sec", 0.0)
-            )
-
-            if state["prosody_features"]
-            else 0,
+            ) if state["prosody_features"] else 0,
             audio_file_path=str(state["audio_path"]) if state["audio_path"] else None,
-            response_audio_path=None,  # Will be updated after TTS
-            
-            # TTS generation details
+            response_audio_path=None,
             tts_prompt=state["llm_response"].tts_style_prompt,
-            
-            # Performance metrics
             response_generation_time_ms=state.get("llm_time_ms", 0),
-            
-            # Safety & moderation (from Gemini's safety assessment)
             safety_check_passed=state["llm_response"].safety_flags.crisis_risk != "high",
             safety_flags = sanitize_for_state(state["llm_response"].safety_flags),
-            
-            # Timestamp
             created_at=datetime.now(timezone.utc),
-            
-            # ✅ SEMANTIC EMBEDDING FOR VECTOR SEARCH
             embedding=embedding_list,
         )
 
         _workflow_services.db_session.add(conversation)
         _workflow_services.db_session.commit()
+        
+        # Refresh to get the ID generated by the DB
+        _workflow_services.db_session.refresh(conversation)
 
         logger.info(
             f"✅ Stored conversation {conversation.id} with embedding "
             f"(emotion={conversation.detected_emotion}, safety={conversation.safety_check_passed})"
         )
-        return True
+        return str(conversation.id) # RETURN THE UUID STRING
 
     except Exception as e:
         logger.error(f"❌ Failed to store conversation: {e}", exc_info=True)
         _workflow_services.db_session.rollback()
-        return False
-
+        return None # Return None instead of False
+    
 
 def _store_memories(state: WorkflowState) -> bool:
-    """Store memories extracted by LLM."""
+    """Store memories extracted by LLM with strict UUID validation."""
     try:
+        # 1. Check if LLM actually proposed any memories
         if not state["llm_response"] or not state["llm_response"].memory_updates:
             return False
 
-        # Convert LLM memory updates to database models with IndicBERT embeddings
+        # 2. CRITICAL FIX: Validate conversation_id type
+        # In previous logs, this was 'True' (bool), which caused the crash.
+        conv_id = state.get("conversation_id")
+        
+        if not conv_id or isinstance(conv_id, bool):
+            logger.error(
+                f"❌ Memory storage aborted: conversation_id is invalid type ({type(conv_id)}). "
+                "Ensure _store_conversation returns a UUID string and not a Boolean."
+            )
+            return False
+
+        # 3. Convert LLM memory updates to database models with IndicBERT embeddings
         stored_memories = _workflow_services.memory_service.store_memories_batch(
             db=_workflow_services.db_session,
-            user_id=state["user_id"],  # Fixed: was 'userid', should be 'user_id'
+            user_id=state["user_id"],
             memory_updates=state["llm_response"].memory_updates,
-            conversation_id=state["conversation_id"],
+            conversation_id=conv_id, # Must be a String/UUID
         )
 
-        logger.info(f"Stored {len(stored_memories)} memories")
+        logger.info(f"✅ Stored {len(stored_memories)} memories linked to conversation {conv_id}")
         return len(stored_memories) > 0
 
     except Exception as e:
-        logger.error(f"Failed to store memories: {e}", exc_info=True)
+        logger.error(f"❌ Failed to store memories: {e}", exc_info=True)
+        # Rollback the session to maintain data integrity
         _workflow_services.db_session.rollback()
         return False
-
-
+    
 # ============================================================================
 # PUBLIC API - Workflow execution entry point
 # ============================================================================
