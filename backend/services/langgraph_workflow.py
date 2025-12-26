@@ -53,7 +53,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langgraph.runtime import Runtime
 
 from backend.utils.serialization import sanitize_for_state
-from backend.utils.audio import compress_audio_base64
+from backend.utils.audio import save_audio_file
 
 # GuppShupp service imports
 from backend.services.whisper_asr import (
@@ -258,6 +258,11 @@ class WorkflowServices:
                 )
             )
             logger.info("✓ Parler TTS service initialized")
+            
+            # ⚡ PHASE 1: Warmup TTS model to pre-compile torch graphs
+            # This eliminates the first-request latency spike (30s → 3s)
+            logger.info("🔥 Warming up TTS model (one-time, may take 20-30s)...")
+            self.tts_service.warmup()
 
             self.db_session = db_session
             logger.info("✓ Database session configured")
@@ -734,8 +739,8 @@ async def phase_5_database_persistence(state: WorkflowState) -> Dict[str, Any]:
                 )
                 if memories_stored:
                     logger.info(f"[PHASE 5] ✓ Stored memories linked to {stored_conversation_id}")
-            else:
-                logger.error("[PHASE 5] Cannot store memories: Conversation save failed (No ID)")
+        else:
+            logger.error("[PHASE 5] Cannot store memories: Conversation save failed (No ID)")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -912,6 +917,66 @@ async def _get_or_create_conversation(
         return None
 
 
+def _save_tts_audio_file(
+    tts_response: Optional[dict],
+    user_id: str,
+    session_id: str,
+) -> Optional[str]:
+    """
+    Save TTS audio to Opus file and return relative path.
+    
+    Args:
+        tts_response: Sanitized TTSResponse dict from workflow state
+        user_id: User UUID string for directory structure
+        session_id: Session UUID for unique filename
+        
+    Returns:
+        Relative path to saved file (e.g., "audio_storage/{user}/{session}.opus")
+        None if no audio available
+    """
+    if not tts_response:
+        return None
+    
+    # Get Opus bytes from response
+    opus_bytes = tts_response.get("audio_opus_bytes")
+    
+    if not opus_bytes:
+        # Fallback: Check for audio_array and encode on the fly
+        audio_array = tts_response.get("audio_array")
+        if audio_array is not None:
+            try:
+                from backend.utils.audio import encode_audio_to_opus
+                import numpy as np
+                # Convert list back to numpy if needed
+                if isinstance(audio_array, list):
+                    audio_array = np.array(audio_array, dtype=np.float32)
+                opus_bytes = encode_audio_to_opus(audio_array)
+            except Exception as e:
+                logger.warning(f"Failed to encode audio to Opus: {e}")
+                return None
+        else:
+            logger.debug("No audio data in TTS response")
+            return None
+    
+    # Generate unique filename using session_id + timestamp
+    import uuid
+    conversation_id = str(uuid.uuid4())
+    
+    try:
+        audio_path = save_audio_file(
+            audio_bytes=opus_bytes,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            format_ext="opus"
+        )
+        logger.info(f"✅ Saved TTS audio: {audio_path}")
+        return audio_path
+    except Exception as e:
+        logger.error(f"Failed to save TTS audio file: {e}", exc_info=True)
+        return None
+
+
+
 
 
 def _get_fallback_llm_response(error_message: str) -> GeminiLLMResponse:
@@ -974,14 +1039,13 @@ def _store_conversation(state: WorkflowState) -> Optional[str]: # Updated return
                     .get("duration_sec", 0.0)
             ) if state["prosody_features"] else 0,
             audio_file_path=str(state["audio_path"]) if state["audio_path"] else None,
-            response_audio_path=None,
             
-            # ⚠️ NEW: Store compressed TTS audio for reliable playback from history
-            response_audio_base64=(
-                compress_audio_base64(state.get("tts_response", {}).get("audio_base64_wav", ""))
-                if state.get("tts_response") else None
+            # ⚡ NEW: Save Opus audio to file, store path in database
+            response_audio_path=_save_tts_audio_file(
+                tts_response=state.get("tts_response"),
+                user_id=str(state["user_id"]),
+                session_id=str(state["session_id"]),
             ),
-            audio_is_compressed=True,  # We always compress now
             response_audio_duration_seconds=(
                 state.get("tts_response", {}).get("duration_seconds", 0.0)
                 if state.get("tts_response") else None

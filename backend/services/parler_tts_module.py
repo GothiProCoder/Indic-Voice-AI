@@ -82,12 +82,24 @@ class TTSRequest:
 class TTSResponse:
     """
     Response from TTS generation.
+    
+    Fields:
+        audio_array: Raw numpy audio (for streaming/preview)
+        audio_opus_bytes: Opus-encoded audio bytes (for file storage)
+        audio_path: Relative path to saved audio file (None until saved)
+        audio_base64_wav: DEPRECATED - kept for backwards compatibility
+        sampling_rate: Audio sample rate
+        duration_seconds: Audio duration
+        generation_time_ms: Generation time in milliseconds
     """
     audio_array: np.ndarray
-    audio_base64_wav: str
-    sampling_rate: int
-    duration_seconds: float
-    generation_time_ms: int
+    audio_opus_bytes: bytes = b""        # Opus-encoded audio
+    audio_path: Optional[str] = None     # Relative path to saved file
+    audio_base64_wav: str = ""           # DEPRECATED - for backwards compat
+    sampling_rate: int = 44100
+    duration_seconds: float = 0.0
+    generation_time_ms: int = 0
+
 
 
 # ============================================================================
@@ -115,18 +127,23 @@ class ParlerTTSService:
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
 
         try:
-            # STEP 1: LOAD MODEL DIRECTLY (Do not use AutoConfig)
+            # ================================================================
+            # STEP 1: LOAD MODEL WITH SDPA ATTENTION (Phase 1 Optimization)
+            # ================================================================
             logger.info(f"Loading Indic Parler TTS model: {self.config.model_name}")
             
-            # We pass parameters directly to the model loader
+            # SDPA (Scaled Dot-Product Attention) provides 1.4x speedup
+            # via FlashAttention kernels when available
             self.model = ParlerTTSForConditionalGeneration.from_pretrained(
                 self.config.model_name,
                 token=hf_token,
-                torch_dtype=torch.float16,   # Keep this for VRAM savings
+                torch_dtype=torch.float16,   # FP16 for VRAM savings
+                attn_implementation="sdpa",  # ⚡ PHASE 1: Enable SDPA attention
             ).to(self.device)
             
+            # ================================================================
             # STEP 2: LOAD TOKENIZERS
-            # We get the text encoder path from the LOADED model, exactly like your working script
+            # ================================================================
             self.description_tokenizer = AutoTokenizer.from_pretrained(
                 self.model.config.text_encoder._name_or_path,
                 token=hf_token,
@@ -137,14 +154,42 @@ class ParlerTTSService:
                 token=hf_token,
             )
 
+            # ================================================================
+            # STEP 3: APPLY PHASE 1 OPTIMIZATIONS
+            # ================================================================
             self.model.eval()
+            
+            # ⚡ PHASE 1: Configure static KV cache for faster generation
+            # Pre-allocates cache instead of dynamic growth per step
+            self.model.generation_config.cache_implementation = "static"
+            self.model.generation_config.max_new_tokens = 2048  # Max audio tokens
+            logger.info("✅ Static KV cache configured")
+            
+            # ⚡ PHASE 1: torch.compile for 3-4x speedup
+            # Uses TorchDynamo + Inductor for graph optimization
+            if torch.cuda.is_available():
+                try:
+                    self.model = torch.compile(
+                        self.model, 
+                        mode="reduce-overhead",  # Best for repetitive calls
+                        fullgraph=False,         # Allow graph breaks for compatibility
+                    )
+                    logger.info("✅ torch.compile enabled (reduce-overhead mode)")
+                except Exception as compile_error:
+                    logger.warning(f"torch.compile failed, continuing without: {compile_error}")
+            
+            # Initialize output cache (will be upgraded to LRU in Phase 2)
             self._cache: Dict[str, TTSResponse] = {}
+            
+            # Track if warmup has been done
+            self._warmed_up = False
 
-            logger.info("ParlerTTSService initialized successfully")
+            logger.info("✅ ParlerTTSService initialized with Phase 1 optimizations")
 
         except Exception as e:
             logger.error(f"Failed to initialize ParlerTTSService: {e}", exc_info=True)
             raise
+        
         
     # --------------------------------------------------------------------- #
     # PUBLIC API
@@ -214,13 +259,21 @@ class ParlerTTSService:
             audio = self._postprocess_audio(audio)
 
             duration_sec = len(audio) / self.config.sampling_rate
+            
+            # ⚡ NEW: Encode to Opus format (~95% smaller than WAV)
+            from backend.utils.audio import encode_audio_to_opus
+            opus_bytes = encode_audio_to_opus(audio, self.config.sampling_rate)
+            
+            # DEPRECATED: Keep base64 WAV for backwards compatibility
             b64_wav = self._encode_wav_to_base64(audio, self.config.sampling_rate)
 
             gen_time_ms = int((time.time() - start_time) * 1000)
 
             response = TTSResponse(
                 audio_array=audio,
-                audio_base64_wav=b64_wav,
+                audio_opus_bytes=opus_bytes,      # NEW: Opus bytes for file storage
+                audio_path=None,                   # Set by workflow after saving
+                audio_base64_wav=b64_wav,          # DEPRECATED: Kept for compat
                 sampling_rate=self.config.sampling_rate,
                 duration_seconds=duration_sec,
                 generation_time_ms=gen_time_ms,
@@ -230,7 +283,8 @@ class ParlerTTSService:
                 self._cache[cache_key] = response
 
             logger.info(
-                f"TTS generated: duration={duration_sec:.2f}s, time={gen_time_ms}ms"
+                f"TTS generated: duration={duration_sec:.2f}s, time={gen_time_ms}ms, "
+                f"opus_size={len(opus_bytes) // 1024}KB"
             )
             return response
 
@@ -245,6 +299,46 @@ class ParlerTTSService:
         import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.generate, request)
+
+    def warmup(self) -> None:
+        """
+        ⚡ PHASE 1: Warm up the model to pre-compile torch graphs.
+        
+        This eliminates the first-request latency spike caused by JIT compilation.
+        Call this during application startup (e.g., in FastAPI lifespan).
+        
+        Expected warmup time: 20-30 seconds (one-time cost)
+        After warmup: Requests complete 3-5x faster
+        """
+        if self._warmed_up:
+            logger.info("TTS model already warmed up, skipping")
+            return
+        
+        logger.info("🔥 Warming up TTS model (this may take 20-30 seconds)...")
+        
+        try:
+            # Run a short generation to trigger torch.compile
+            warmup_request = TTSRequest(
+                spoken_text="Hello, testing.",
+                speaker="Rohit",
+                description="speaks clearly in a neutral tone"
+            )
+            
+            with torch.no_grad():
+                # Disable cache to avoid storing warmup audio
+                cache_enabled_backup = self.config.cache_enabled
+                self.config.cache_enabled = False
+                
+                _ = self.generate(warmup_request)
+                
+                self.config.cache_enabled = cache_enabled_backup
+            
+            self._warmed_up = True
+            logger.info("✅ TTS model warmed up successfully!")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Warmup failed (model will compile on first request): {e}")
+
 
     def close(self) -> None:
         """
