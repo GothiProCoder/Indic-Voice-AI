@@ -498,30 +498,49 @@ def create_new_session():
 
 
 def load_session_history(session_id: str):
-    """Load conversation history for session."""
+    """
+    Load conversation history for session WITHOUT audio (fast load).
+    
+    Audio is loaded on-demand when user clicks play button.
+    """
     try:
         client = get_api_client()
-        history = client.get_history(session_id, limit=50)
+        
+        # Fetch history WITHOUT audio for fast initial load
+        history_data = client.get_history(session_id, limit=50, include_audio=False)
+        history = history_data.get("items", [])
         
         messages = []
-        for conv in reversed(history):  # Reverse to get chronological order
+        for conv in history:  # Already in chronological order from API
+            # User message
             messages.append({
                 "role": "user",
                 "text": conv.get("user_input_text", ""),
                 "emotion": None,
+                "audio_base64": None,
+                "conversation_id": None,
                 "timestamp": conv.get("created_at")
             })
+            
+            # Assistant message - NO audio initially, just metadata
             messages.append({
                 "role": "assistant",
                 "text": conv.get("ai_response_text", ""),
                 "emotion": conv.get("detected_emotion"),
+                "audio_base64": None,  # Will be loaded on-demand
+                "conversation_id": str(conv.get("id")),  # For on-demand fetch
+                "has_audio": conv.get("has_audio", False),
+                "response_duration_seconds": conv.get("response_duration_seconds"),
                 "timestamp": conv.get("created_at")
             })
         
         st.session_state.messages = messages
+        logger.info(f"📜 Loaded {len(history)} conversations (audio=on-demand)")
         
     except Exception as e:
+        logger.error(f"Failed to load history: {e}", exc_info=True)
         st.warning(f"Could not load history: {e}")
+
 
 
 def logout():
@@ -606,12 +625,34 @@ def render_messages():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Audio player
+                # Audio player - On-demand loading
+                audio_b64 = msg.get("audio_base64")
+                has_audio = msg.get("has_audio", False)
+                conversation_id = msg.get("conversation_id")
+                duration = msg.get("response_duration_seconds")
+                
                 if audio_b64:
+                    # Audio already loaded - show player
                     logger.info(f"🔊 Rendering audio player: {len(audio_b64)} chars")
                     st.audio(f"data:audio/wav;base64,{audio_b64}")
-                else:
-                    logger.warning(f"⚠️ No audio_base64 for assistant message: {text[:50]}...")
+                elif has_audio and conversation_id:
+                    # Audio available but not loaded - show load button
+                    duration_str = f" ({duration:.1f}s)" if duration else ""
+                    if st.button(f"🔊 Load Audio{duration_str}", key=f"load_audio_{conversation_id}"):
+                        try:
+                            client = get_api_client()
+                            audio_data = client.get_conversation_audio(conversation_id)
+                            if audio_data and audio_data.get("audio_base64"):
+                                # Update message with loaded audio
+                                msg["audio_base64"] = audio_data["audio_base64"]
+                                st.rerun()  # Rerun to show audio player
+                            else:
+                                st.warning("Audio not available")
+                        except Exception as e:
+                            st.error(f"Failed to load audio: {e}")
+                elif not has_audio:
+                    # No audio for this message (old conversation or TTS failed)
+                    pass  # Don't show anything
 
 
 

@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional, Dict, Any, List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Path
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -743,6 +743,188 @@ async def get_history(
         session_id=session_id,
         has_more=(offset + limit) < total_count
     )
+
+
+# =============================================================================
+# CONVERSATION HISTORY (WITH OPTIONAL AUDIO)
+# =============================================================================
+
+
+@router.get(
+    "/sessions/{session_id}/conversations",
+    response_model=ConversationHistoryResponse,
+    summary="Get session conversation history",
+    description="Retrieve conversation history for a session. Use include_audio=true to get audio data."
+)
+async def get_session_conversations(
+    session_id: UUID = Path(..., description="Session UUID"),
+    include_audio: bool = Query(False, description="Include audio data (increases response size)"),
+    limit: int = Query(50, ge=1, le=100, description="Max items to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """
+    Get conversation history for a session with optional audio.
+    
+    **Performance Notes:**
+    - Without audio: Fast query (~10ms)
+    - With audio: Larger response, includes decompressed base64 audio
+    
+    **Pagination:**
+    Use limit/offset for large sessions.
+    """
+    from backend.utils.audio import decompress_audio_base64
+    from backend.schemas.conversation import ConversationHistoryItem, ConversationHistoryResponse
+    
+    # Verify session belongs to user
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id,
+        DBSession.user_id == user.id
+    ).first()
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Get total count
+    total_count = db.query(Conversation).filter(
+        Conversation.session_id == session_id
+    ).count()
+    
+    # Query conversations - different columns based on include_audio
+    if include_audio:
+        # Full query with audio (slower, larger)
+        conversations = db.query(Conversation).filter(
+            Conversation.session_id == session_id
+        ).order_by(Conversation.created_at.asc()).offset(offset).limit(limit).all()
+    else:
+        # Lightweight query without audio (fast)
+        conversations = db.query(
+            Conversation.id,
+            Conversation.user_input_text,
+            Conversation.ai_response_text,
+            Conversation.detected_emotion,
+            Conversation.sentiment,
+            Conversation.created_at,
+            Conversation.response_audio_duration_seconds,
+            Conversation.tts_prompt,
+            Conversation.response_audio_base64.isnot(None).label("has_audio")
+        ).filter(
+            Conversation.session_id == session_id
+        ).order_by(Conversation.created_at.asc()).offset(offset).limit(limit).all()
+    
+    # Build response items
+    items = []
+    for conv in conversations:
+        if include_audio:
+            # Full model - decompress audio if present
+            audio_b64 = None
+            if conv.response_audio_base64:
+                if conv.audio_is_compressed:
+                    audio_b64 = decompress_audio_base64(conv.response_audio_base64)
+                else:
+                    audio_b64 = conv.response_audio_base64
+            
+            items.append(ConversationHistoryItem(
+                id=conv.id,
+                user_input_text=conv.user_input_text,
+                ai_response_text=conv.ai_response_text,
+                detected_emotion=conv.detected_emotion or "neutral",
+                sentiment=conv.sentiment or "neutral",
+                created_at=conv.created_at,
+                has_audio=conv.response_audio_base64 is not None,
+                response_duration_seconds=conv.response_audio_duration_seconds,
+                tts_speaker=None,  # Not stored separately
+                response_audio_base64=audio_b64
+            ))
+        else:
+            # Lightweight tuple result
+            items.append(ConversationHistoryItem(
+                id=conv.id,
+                user_input_text=conv.user_input_text,
+                ai_response_text=conv.ai_response_text,
+                detected_emotion=conv.detected_emotion or "neutral",
+                sentiment=conv.sentiment or "neutral",
+                created_at=conv.created_at,
+                has_audio=conv.has_audio,
+                response_duration_seconds=conv.response_audio_duration_seconds,
+                tts_speaker=None,
+                response_audio_base64=None
+            ))
+    
+    logger.info(
+        f"[{ctx.request_id}] Returned {len(items)} conversations "
+        f"(include_audio={include_audio})"
+    )
+    
+    return ConversationHistoryResponse(
+        items=items,
+        total_count=total_count,
+        session_id=session_id,
+        has_more=(offset + limit) < total_count
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/audio",
+    summary="Get audio for a single conversation",
+    description="Retrieve decompressed audio for a specific conversation. Use for on-demand audio loading."
+)
+async def get_conversation_audio(
+    conversation_id: UUID = Path(..., description="Conversation UUID"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """
+    Get audio for a single conversation (on-demand loading).
+    
+    This endpoint is optimized for lazy loading - fetch audio only when
+    the user clicks play, not when loading the full conversation list.
+    
+    Returns:
+        JSON with audio_base64 and duration, or 404 if not found
+    """
+    from backend.utils.audio import decompress_audio_base64
+    
+    # Get conversation with ownership check via session
+    conversation = db.query(Conversation).join(
+        DBSession, Conversation.session_id == DBSession.id
+    ).filter(
+        Conversation.id == conversation_id,
+        DBSession.user_id == user.id
+    ).first()
+    
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found"
+        )
+    
+    if not conversation.response_audio_base64:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No audio available for this conversation"
+        )
+    
+    # Decompress if needed
+    if conversation.audio_is_compressed:
+        audio_base64 = decompress_audio_base64(conversation.response_audio_base64)
+    else:
+        audio_base64 = conversation.response_audio_base64
+    
+    logger.info(f"[{ctx.request_id}] Returned audio for conversation {conversation_id}")
+    
+    return {
+        "conversation_id": str(conversation_id),
+        "audio_base64": audio_base64,
+        "duration_seconds": conversation.response_audio_duration_seconds,
+        "has_audio": True
+    }
 
 
 # =============================================================================

@@ -53,6 +53,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langgraph.runtime import Runtime
 
 from backend.utils.serialization import sanitize_for_state
+from backend.utils.audio import compress_audio_base64
 
 # GuppShupp service imports
 from backend.services.whisper_asr import (
@@ -974,6 +975,18 @@ def _store_conversation(state: WorkflowState) -> Optional[str]: # Updated return
             ) if state["prosody_features"] else 0,
             audio_file_path=str(state["audio_path"]) if state["audio_path"] else None,
             response_audio_path=None,
+            
+            # ⚠️ NEW: Store compressed TTS audio for reliable playback from history
+            response_audio_base64=(
+                compress_audio_base64(state.get("tts_response", {}).get("audio_base64_wav", ""))
+                if state.get("tts_response") else None
+            ),
+            audio_is_compressed=True,  # We always compress now
+            response_audio_duration_seconds=(
+                state.get("tts_response", {}).get("duration_seconds", 0.0)
+                if state.get("tts_response") else None
+            ),
+            
             tts_prompt=state["llm_response"].tts_style_prompt,
             response_generation_time_ms=state.get("llm_time_ms", 0),
             safety_check_passed=state["llm_response"].safety_flags.crisis_risk != "high",
