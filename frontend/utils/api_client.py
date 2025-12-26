@@ -585,32 +585,66 @@ class GuppShuppClient:
     def get_history(
         self,
         session_id: str,
-        limit: int = 20,
-        offset: int = 0
-    ) -> list:
+        limit: int = 50,
+        offset: int = 0,
+        include_audio: bool = False
+    ) -> dict:
         """
-        Get conversation history for session.
+        Get conversation history for session with optional audio.
         
         Args:
             session_id: Session UUID
             limit: Max items to return
             offset: Pagination offset
+            include_audio: Whether to include audio data (larger response)
             
         Returns:
-            List of conversation items
+            Dict with 'items', 'total_count', 'has_more'
         """
         response = self._client.get(
-            f"{self.base_url}/conversations/history",
+            f"{self.base_url}/conversations/sessions/{session_id}/conversations",
             headers=self._get_headers(),
             params={
-                "session_id": session_id,
                 "limit": limit,
-                "offset": offset
-            }
+                "offset": offset,
+                "include_audio": include_audio
+            },
+            timeout=60.0  # Longer timeout when fetching audio
         )
         
         data = self._handle_response(response)
-        return data.get("items", [])
+        return data
+    
+    def get_conversation_audio(self, conversation_id: str) -> Optional[dict]:
+        """
+        Get audio for a specific conversation (on-demand loading).
+        
+        Calls the dedicated /conversations/{id}/audio endpoint.
+        
+        Args:
+            conversation_id: Conversation UUID
+            
+        Returns:
+            Dict with audio_base64, duration_seconds, or None if not available
+        """
+        try:
+            response = self._client.get(
+                f"{self.base_url}/conversations/conversations/{conversation_id}/audio",
+                headers=self._get_headers(),
+                timeout=30.0
+            )
+            
+            if response.status_code == 404:
+                return None
+            
+            data = self._handle_response(response)
+            return data
+            
+        except Exception as e:
+            logger.warning(f"Failed to fetch audio for {conversation_id}: {e}")
+            return None
+    
+    
     
     # =========================================================================
     # CLEANUP
