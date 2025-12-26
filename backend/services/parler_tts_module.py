@@ -58,7 +58,7 @@ class TTSConfig:
     Configuration for Indic Parler TTS.
     """
     # RECOMMENDATION: use the fine-tuned model, not the bare pretrained
-    model_name: str = "ai4bharat/indic-parler-t"
+    model_name: str = "ai4bharat/indic-parler-tts"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     sampling_rate: int = 44100
     cache_enabled: bool = True
@@ -118,78 +118,114 @@ class ParlerTTSService:
     """
 
     def __init__(self, config: Optional[TTSConfig] = None):
+        """
+        Initialize Parler TTS Service for Indic languages.
+        
+        Args:
+            config: Optional TTSConfig. If None, uses defaults.
+        
+        Raises:
+            Exception: If model loading or initialization fails.
+        """
         self.config = config or TTSConfig()
         self.device = torch.device(self.config.device)
-
+        
         logger.info(f"Initializing ParlerTTSService on device={self.config.device}")
         
         # Optional: Hugging Face token from env
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
-
+        
         try:
             # ================================================================
-            # STEP 1: LOAD MODEL WITH SDPA ATTENTION (Phase 1 Optimization)
+            # STEP 1: LOAD MODEL WITH EAGER ATTENTION
             # ================================================================
             logger.info(f"Loading Indic Parler TTS model: {self.config.model_name}")
             
-            # SDPA (Scaled Dot-Product Attention) provides 1.4x speedup
-            # via FlashAttention kernels when available
+            # Use eager attention for compatibility.
+            # T5EncoderModel (used internally by ParlerTTS) does NOT support SDPA.
+            # Reference: https://github.com/huggingface/transformers/issues/28005
             self.model = ParlerTTSForConditionalGeneration.from_pretrained(
                 self.config.model_name,
                 token=hf_token,
-                torch_dtype=torch.float16,   # FP16 for VRAM savings
-                attn_implementation="sdpa",  # ⚡ PHASE 1: Enable SDPA attention
+                torch_dtype=torch.float16,      # FP16 for VRAM savings (~50% memory reduction)
+                attn_implementation="eager",    # ✅ Compatible with T5EncoderModel
             ).to(self.device)
+            
+            logger.info(f"✅ Model loaded successfully on {self.device}")
             
             # ================================================================
             # STEP 2: LOAD TOKENIZERS
             # ================================================================
+            logger.info("Loading tokenizers...")
+            
+            # Description tokenizer (for speaker style descriptions)
             self.description_tokenizer = AutoTokenizer.from_pretrained(
                 self.model.config.text_encoder._name_or_path,
                 token=hf_token,
             )
             
+            # Text tokenizer (for the actual speech text)
             self.text_tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model_name,
                 token=hf_token,
             )
-
+            
+            logger.info("✅ Tokenizers loaded successfully")
+            
             # ================================================================
-            # STEP 3: APPLY PHASE 1 OPTIMIZATIONS
+            # STEP 3: PREPARE MODEL FOR INFERENCE
             # ================================================================
+            # Set model to evaluation mode (disables dropout, batch norm, etc.)
             self.model.eval()
+            logger.info("✅ Model set to evaluation mode")
             
-            # ⚡ PHASE 1: Configure static KV cache for faster generation
-            # Pre-allocates cache instead of dynamic growth per step
-            self.model.generation_config.cache_implementation = "static"
-            self.model.generation_config.max_new_tokens = 2048  # Max audio tokens
-            logger.info("✅ Static KV cache configured")
+            # Configure generation parameters
+            self.model.generation_config.max_new_tokens = 2048  # Max audio tokens (~20s audio)
+            logger.info("✅ Generation config set (max_new_tokens=2048)")
             
-            # ⚡ PHASE 1: torch.compile for 3-4x speedup
-            # Uses TorchDynamo + Inductor for graph optimization
-            if torch.cuda.is_available():
-                try:
-                    self.model = torch.compile(
-                        self.model, 
-                        mode="reduce-overhead",  # Best for repetitive calls
-                        fullgraph=False,         # Allow graph breaks for compatibility
-                    )
-                    logger.info("✅ torch.compile enabled (reduce-overhead mode)")
-                except Exception as compile_error:
-                    logger.warning(f"torch.compile failed, continuing without: {compile_error}")
-            
-            # Initialize output cache (will be upgraded to LRU in Phase 2)
+            # ================================================================
+            # STEP 4: INITIALIZE CACHING AND STATE
+            # ================================================================
+            # Simple dict cache for generated audio (key = hash of inputs)
             self._cache: Dict[str, TTSResponse] = {}
             
-            # Track if warmup has been done
+            # Track warmup state
             self._warmed_up = False
-
-            logger.info("✅ ParlerTTSService initialized with Phase 1 optimizations")
-
+            
+            logger.info("✅ Cache and state initialized")
+            
+            # ================================================================
+            # NOTES ON DISABLED OPTIMIZATIONS
+            # ================================================================
+            # The following optimizations are DISABLED for stability:
+            #
+            # 1. Static KV Cache:
+            #    - self.model.generation_config.cache_implementation = "static"
+            #    - Can cause issues with T5EncoderModel
+            #    - Enable only after thorough testing
+            #
+            # 2. torch.compile():
+            #    - Provides 3-4x speedup but requires:
+            #      * Proper warmup (30-60s at startup)
+            #      * PyTorch 2.0+
+            #      * May have compatibility issues
+            #    - Enable via environment variable when needed
+            #
+            # To enable optimizations:
+            #    Set ENABLE_TORCH_COMPILE=true in environment
+            #    Then call warmup() after initialization
+            
+            logger.info("✅ ParlerTTSService initialized successfully")
+            logger.info(f"   Model: {self.config.model_name}")
+            logger.info(f"   Device: {self.device}")
+            logger.info(f"   Precision: FP16")
+            logger.info(f"   Attention: eager (T5-compatible)")
+            logger.info(f"   Cache enabled: {self.config.cache_enabled}")
+            
         except Exception as e:
-            logger.error(f"Failed to initialize ParlerTTSService: {e}", exc_info=True)
+            logger.error(f"❌ Failed to initialize ParlerTTSService: {e}", exc_info=True)
             raise
-        
+    
         
     # --------------------------------------------------------------------- #
     # PUBLIC API
@@ -302,42 +338,64 @@ class ParlerTTSService:
 
     def warmup(self) -> None:
         """
-        ⚡ PHASE 1: Warm up the model to pre-compile torch graphs.
+        ⚡ Warm up the model to pre-compile torch graphs.
         
         This eliminates the first-request latency spike caused by JIT compilation.
         Call this during application startup (e.g., in FastAPI lifespan).
         
-        Expected warmup time: 20-30 seconds (one-time cost)
+        Expected warmup time: 30-60 seconds (one-time cost)
         After warmup: Requests complete 3-5x faster
         """
         if self._warmed_up:
-            logger.info("TTS model already warmed up, skipping")
+            logger.info("✅ TTS model already warmed up, skipping")
             return
         
-        logger.info("🔥 Warming up TTS model (this may take 20-30 seconds)...")
+        if not self._needs_warmup:
+            logger.info("ℹ️ Warmup not needed (torch.compile disabled)")
+            self._warmed_up = True
+            return
+        
+        logger.info("🔥 Warming up TTS model (this may take 30-60 seconds)...")
+        import time
+        start_time = time.time()
         
         try:
-            # Run a short generation to trigger torch.compile
-            warmup_request = TTSRequest(
-                spoken_text="Hello, testing.",
-                speaker="Rohit",
-                description="speaks clearly in a neutral tone"
-            )
+            # Run 2 warmup generations to trigger torch.compile
+            warmup_texts = [
+                "Hello, testing one two three.",
+                "नमस्ते, यह एक परीक्षण है।"
+            ]
             
-            with torch.no_grad():
+            for i, text in enumerate(warmup_texts, 1):
+                logger.info(f"  Warmup pass {i}/{len(warmup_texts)}...")
+                
+                warmup_request = TTSRequest(
+                    spoken_text=text,
+                    speaker="Rohit",
+                    description="speaks clearly in a neutral tone with good audio quality"
+                )
+                
                 # Disable cache to avoid storing warmup audio
                 cache_enabled_backup = self.config.cache_enabled
                 self.config.cache_enabled = False
                 
-                _ = self.generate(warmup_request)
+                with torch.no_grad():
+                    _ = self.generate(warmup_request)
                 
                 self.config.cache_enabled = cache_enabled_backup
+                logger.info(f"  ✅ Warmup pass {i}/{len(warmup_texts)} complete")
             
+            # Force CUDA synchronization
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            elapsed = time.time() - start_time
             self._warmed_up = True
-            logger.info("✅ TTS model warmed up successfully!")
+            logger.info(f"✅ TTS model warmed up successfully in {elapsed:.1f}s!")
             
         except Exception as e:
             logger.warning(f"⚠️ Warmup failed (model will compile on first request): {e}")
+            self._warmed_up = False
 
 
     def close(self) -> None:
