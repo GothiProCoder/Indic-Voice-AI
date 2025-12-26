@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Generator, Union
 from uuid import uuid4
+import numpy as np
+import io
 
 logger = logging.getLogger(__name__)
 
